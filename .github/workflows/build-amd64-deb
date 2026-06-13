@@ -1,0 +1,584 @@
+name: Build Linux AMD64 Package
+
+on:
+  workflow_dispatch:
+
+env:
+  BUILD_CONFIGURATION: Release
+  TARGET_RUNTIME: linux-amd64
+  INSTALL_DIRECTORY: /home/pi/pins
+  PUBLISH_DIRECTORY: artifacts/publish
+  PACKAGE_ROOT: artifacts/package
+  PACKAGE_NAME: pins-linux-amd64
+  DEB_ROOT: artifacts/debroot
+  DEB_PACKAGE: pins
+  DEB_ARCH: amd64
+  PLUGINS_INSTALL_BASE: /home/pi/.local/share/NINA/Plugins/3.0.0
+  PLUGIN_DEB_BASE: artifacts/plugin-debroot
+  PLUGIN_ARTIFACT_DIR: artifacts/plugins
+  PLUGIN_MSBUILD_ARGS: -p:DisableImplicitSystemDrawingReference=true
+  PLUGIN_FAILURES_FILE: artifacts/plugin-build-failures.log
+
+jobs:
+  build-linux-amd64:
+    name: Build Raspberry Pi package and plugin debs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          submodules: false
+
+      - name: Update submodules to latest commits
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          excluded_path="NINA/External"
+
+          # Update all submodules except NINA/External (has LFS issues in CI)
+          while read -r _ path; do
+            if [ "$path" = "$excluded_path" ]; then
+              echo "Skipping submodule $path"
+              continue
+            fi
+
+            echo "Updating submodule $path"
+            if git submodule update --init --recursive --remote "$path"; then
+              continue
+            fi
+
+            echo "Remote update failed for $path; falling back to pinned commit" >&2
+            git submodule update --init --recursive "$path"
+          done < <(git config -f .gitmodules --get-regexp '^submodule\..*\.path$')
+
+      - name: Populate NINA/External from zip bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          url="http://cloud.astro-narren.de/public.php/dav/files/7tEAZoEpCMCYyeX/?accept=zip"
+          tmp_dir="$(mktemp -d)"
+          zip_path="$tmp_dir/external.zip"
+          unzip_dir="$tmp_dir/unzipped"
+
+          echo "Downloading External bundle from: $url"
+          curl -L --fail --retry 3 --retry-delay 5 -o "$zip_path" "$url"
+
+          rm -rf "NINA/External"
+          mkdir -p "NINA/External"
+          unzip -q "$zip_path" -d "$unzip_dir"
+
+          if [ ! -d "$unzip_dir/external" ]; then
+            echo "Downloaded zip did not contain top-level folder 'external'" >&2
+            echo "Top-level entries:" >&2
+            (cd "$unzip_dir" && find . -mindepth 1 -maxdepth 2 -print | head -n 50) >&2
+            exit 1
+          fi
+
+          rsync -a "$unzip_dir/external/" "NINA/External/"
+          echo "External bundle extracted into NINA/External"
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - name: Restore linux-amd64 dependencies
+        run: |
+          dotnet restore NINA/NINA.csproj -r ${{ env.TARGET_RUNTIME }}
+          dotnet restore System.Windows.Compat/System.Windows.Compat.csproj
+
+      - name: Build System.Windows.Compat
+        run: dotnet build System.Windows.Compat/System.Windows.Compat.csproj -c ${{ env.BUILD_CONFIGURATION }} --no-restore
+
+      - name: Build linux-amd64 binaries
+        run: dotnet build NINA/NINA.csproj -c ${{ env.BUILD_CONFIGURATION }} -r ${{ env.TARGET_RUNTIME }} --no-restore
+
+      - name: Publish linux-amd64 payload
+        run: dotnet publish NINA/NINA.csproj -c ${{ env.BUILD_CONFIGURATION }} -r ${{ env.TARGET_RUNTIME }} --no-build -o ${{ env.PUBLISH_DIRECTORY }}/${{ env.TARGET_RUNTIME }}
+
+      - name: Determine package version
+        id: version
+        run: |
+          version=$(grep -m1 'AssemblyInformationalVersion' CommonAssemblyInfo.cs | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$version" ]; then
+            echo "Failed to determine version from CommonAssemblyInfo.cs" >&2
+            exit 1
+          fi
+          echo "Package version: $version"
+          echo "package_version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Determine release version
+        id: release_tag
+        run: |
+          release_date=$(date +%d%m%Y)
+          release_version="v${release_date}"
+          echo "Release version: $release_version"
+          echo "Release date: $release_date"
+          echo "RELEASE_DATE=$release_date" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=$release_version" >> "$GITHUB_ENV"
+          echo "value=$release_version" >> "$GITHUB_OUTPUT"
+          echo "date=$release_date" >> "$GITHUB_OUTPUT"
+
+      - name: Stage /home/pi/pins layout
+        run: |
+          publish_root="${{ env.PUBLISH_DIRECTORY }}/${{ env.TARGET_RUNTIME }}"
+          package_root="${{ env.PACKAGE_ROOT }}"
+          rm -rf "$package_root"
+          mkdir -p "$package_root/pins"
+          rsync -a "$publish_root/" "$package_root/pins/"
+          echo "${{ env.INSTALL_DIRECTORY }}" > "$package_root/pins/.install_path"
+
+      - name: Replace System.Windows.dll in payload
+        run: |
+          compat_dll="System.Windows.Compat/bin/${{ env.BUILD_CONFIGURATION }}/net10.0/System.Windows.dll"
+          target_dir="${{ env.PACKAGE_ROOT }}/pins"
+          if [ ! -f "$compat_dll" ]; then
+            echo "Compat build missing at $compat_dll" >&2
+            exit 1
+          fi
+          if [ ! -d "$target_dir" ]; then
+            echo "Target directory $target_dir not found" >&2
+            exit 1
+          fi
+          cp -f "$compat_dll" "$target_dir/System.Windows.dll"
+
+      - name: Prepare Debian filesystem
+        run: |
+          deb_root="${{ env.DEB_ROOT }}"
+          install_root="$deb_root/home/pi/pins"
+          rm -rf "$deb_root"
+          mkdir -p "$install_root"
+          rsync -a "${{ env.PACKAGE_ROOT }}/pins/" "$install_root/"
+
+      - name: Add systemd service
+        run: |
+          deb_root="${{ env.DEB_ROOT }}"
+          service_path="$deb_root/etc/systemd/system/pins.service"
+          service_dir="$(dirname "$service_path")"
+          mkdir -p "$service_dir"
+          cp packaging/systemd/pins.service "$service_path"
+          chmod 644 "$service_path"
+
+      - name: Add Debian maintainer scripts
+        run: |
+          deb_root="${{ env.DEB_ROOT }}"
+          control_dir="$deb_root/DEBIAN"
+          mkdir -p "$control_dir"
+          cp packaging/debian/postinst "$control_dir/postinst"
+          cp packaging/debian/prerm "$control_dir/prerm"
+          chmod 755 "$control_dir/postinst" "$control_dir/prerm"
+
+      - name: Build Debian package
+        run: |
+          deb_root="${{ env.DEB_ROOT }}"
+          control_dir="$deb_root/DEBIAN"
+          mkdir -p "$control_dir"
+          installed_size=$(du -sk "$deb_root/home/pi/pins" | cut -f1)
+          {
+            echo "Package: ${{ env.DEB_PACKAGE }}"
+            echo "Version: ${{ steps.version.outputs.package_version }}"
+            echo "Section: misc"
+            echo "Priority: optional"
+            echo "Architecture: ${{ env.DEB_ARCH }}"
+            echo "Maintainer: N.I.N.A. Team"
+            echo "Installed-Size: $installed_size"
+            echo "Description: Pins build for Raspberry Pi"
+          } > "$control_dir/control"
+          dpkg-deb --build "$deb_root" "artifacts/${{ env.DEB_PACKAGE }}_${{ steps.version.outputs.package_version }}_${{ env.DEB_ARCH }}_${{ steps.release_tag.outputs.date }}.deb"
+
+      - name: Generate SHA256 checksums
+        run: |
+          sha256sum "artifacts/${{ env.DEB_PACKAGE }}_${{ steps.version.outputs.package_version }}_${{ env.DEB_ARCH }}_${{ steps.release_tag.outputs.date }}.deb" > "artifacts/${{ env.DEB_PACKAGE }}_${{ steps.version.outputs.package_version }}_${{ env.DEB_ARCH }}_${{ steps.release_tag.outputs.date }}.deb.sha256"
+
+      - name: Upload Raspberry Pi package
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64-package
+          path: |
+            artifacts/${{ env.DEB_PACKAGE }}_${{ steps.version.outputs.package_version }}_${{ env.DEB_ARCH }}_${{ steps.release_tag.outputs.date }}.deb
+            artifacts/${{ env.DEB_PACKAGE }}_${{ steps.version.outputs.package_version }}_${{ env.DEB_ARCH }}_${{ steps.release_tag.outputs.date }}.deb.sha256
+          retention-days: 30
+      - name: Prepare plugin packaging workspace
+        run: |
+          rm -rf "${{ env.PLUGIN_DEB_BASE }}"
+          mkdir -p "${{ env.PLUGIN_ARTIFACT_DIR }}"
+          mkdir -p "$(dirname "${{ env.PLUGIN_FAILURES_FILE }}")"
+          rm -f "${{ env.PLUGIN_FAILURES_FILE }}"
+
+      - name: Build HocusFocus plugin deb
+        shell: bash
+        run: |
+          set -euo pipefail
+          project_path="NINA.Plugins/joko.nina.plugins/Joko.NINA.Plugins/Joko.NINA.Plugins.HocusFocus/Joko.NINA.Plugins.HocusFocus.csproj"
+          install_folder="joko.nina.plugins"
+          deb_package="pins-plugin-joko"
+          plugin_dir=$(dirname "$project_path")
+          if ! (
+            set -euo pipefail
+            assembly_info="$plugin_dir/Properties/AssemblyInfo.cs"
+            if [ ! -f "$assembly_info" ]; then
+              assembly_info=$(find "$plugin_dir" -name AssemblyInfo.cs | head -n 1)
+            fi
+            if [ -z "$assembly_info" ] || [ ! -f "$assembly_info" ]; then
+              echo "AssemblyInfo.cs not found for $deb_package" >&2
+              exit 1
+            fi
+            assembly_version_line=$(grep -E 'AssemblyVersion' "$assembly_info" || true)
+            plugin_version=$(echo "$assembly_version_line" | sed -E 's/.*"([^\"]+)".*/\1/')
+            if [ -z "$plugin_version" ]; then
+              echo "AssemblyVersion not found in $assembly_info" >&2
+              exit 1
+            fi
+            dotnet restore "$project_path"
+            dotnet build "$project_path" -c ${{ env.BUILD_CONFIGURATION }} --no-restore ${{ env.PLUGIN_MSBUILD_ARGS }}
+            build_root="$plugin_dir/bin/${{ env.BUILD_CONFIGURATION }}"
+            tfm_dir=$(find "$build_root" -maxdepth 1 -type d -name 'net*' | head -n 1)
+            if [ -z "$tfm_dir" ]; then
+              echo "Could not locate target framework output under $build_root" >&2
+              exit 1
+            fi
+            deb_root="${{ env.PLUGIN_DEB_BASE }}/$deb_package"
+            install_root="$deb_root${{ env.PLUGINS_INSTALL_BASE }}/$install_folder"
+            rm -rf "$deb_root"
+            mkdir -p "$install_root"
+            rsync -a "$tfm_dir/" "$install_root/"
+            extra_libs="$plugin_dir/extra-libs"
+            if [ -d "$extra_libs" ]; then
+              find "$extra_libs" -maxdepth 1 -type f -name '*.dll' -exec cp {} "$install_root/" \;
+            fi
+            app_dir="$plugin_dir/app"
+            if [ -d "$app_dir" ]; then
+              rm -rf "$install_root/app"
+              cp -a "$app_dir" "$install_root/app"
+            fi
+            control_dir="$deb_root/DEBIAN"
+            mkdir -p "$control_dir"
+            installed_size=$(du -sk "$deb_root${{ env.PLUGINS_INSTALL_BASE }}" | cut -f1)
+            {
+              echo "Package: $deb_package"
+              echo "Version: $plugin_version"
+              echo "Section: misc"
+              echo "Priority: optional"
+              echo "Architecture: ${{ env.DEB_ARCH }}"
+              echo "Maintainer: N.I.N.A. Team"
+              echo "Installed-Size: $installed_size"
+              echo "Description: NINA plugin package for $install_folder"
+            } > "$control_dir/control"
+            deb_path="${{ env.PLUGIN_ARTIFACT_DIR }}/${deb_package}_${plugin_version}_${{ env.DEB_ARCH }}_${{ steps.release_tag.outputs.date }}.deb"
+            dpkg-deb --build "$deb_root" "$deb_path"
+            sha256sum "$deb_path" > "$deb_path.sha256"
+          ); then
+            echo "$deb_package" | tee -a "${{ env.PLUGIN_FAILURES_FILE }}"
+          fi
+
+      - name: Build LiveStack plugin deb
+        shell: bash
+        run: |
+          set -euo pipefail
+          project_path="NINA.Plugins/LiveStack/nina.plugin.livestack.csproj"
+          install_folder="LiveStack"
+          deb_package="pins-plugin-livestack"
+          plugin_dir=$(dirname "$project_path")
+          if ! (
+            set -euo pipefail
+            assembly_info="$plugin_dir/Properties/AssemblyInfo.cs"
+            if [ ! -f "$assembly_info" ]; then
+              assembly_info=$(find "$plugin_dir" -name AssemblyInfo.cs | head -n 1)
+            fi
+            if [ -z "$assembly_info" ] || [ ! -f "$assembly_info" ]; then
+              echo "AssemblyInfo.cs not found for $deb_package" >&2
+              exit 1
+            fi
+            assembly_version_line=$(grep -E 'AssemblyVersion' "$assembly_info" || true)
+            plugin_version=$(echo "$assembly_version_line" | sed -E 's/.*"([^\"]+)".*/\1/')
+            if [ -z "$plugin_version" ]; then
+              echo "AssemblyVersion not found in $assembly_info" >&2
+              exit 1
+            fi
+            dotnet restore "$project_path"
+            dotnet build "$project_path" -c ${{ env.BUILD_CONFIGURATION }} --no-restore ${{ env.PLUGIN_MSBUILD_ARGS }}
+            build_root="$plugin_dir/bin/${{ env.BUILD_CONFIGURATION }}"
+            tfm_dir=$(find "$build_root" -maxdepth 1 -type d -name 'net*' | head -n 1)
+            if [ -z "$tfm_dir" ]; then
+              echo "Could not locate target framework output under $build_root" >&2
+              exit 1
+            fi
+            deb_root="${{ env.PLUGIN_DEB_BASE }}/$deb_package"
+            install_root="$deb_root${{ env.PLUGINS_INSTALL_BASE }}/$install_folder"
+            rm -rf "$deb_root"
+            mkdir -p "$install_root"
+            rsync -a "$tfm_dir/" "$install_root/"
+            extra_libs="$plugin_dir/extra-libs"
+            if [ -d "$extra_libs" ]; then
+              find "$extra_libs" -maxdepth 1 -type f -name '*.dll' -exec cp {} "$install_root/" \;
+            fi
+            app_dir="$plugin_dir/app"
+            if [ -d "$app_dir" ]; then
+              rm -rf "$install_root/app"
+              cp -a "$app_dir" "$install_root/app"
+            fi
+            control_dir="$deb_root/DEBIAN"
+            mkdir -p "$control_dir"
+            installed_size=$(du -sk "$deb_root${{ env.PLUGINS_INSTALL_BASE }}" | cut -f1)
+            {
+              echo "Package: $deb_package"
+              echo "Version: $plugin_version"
+              echo "Section: misc"
+              echo "Priority: optional"
+              echo "Architecture: ${{ env.DEB_ARCH }}"
+              echo "Maintainer: N.I.N.A. Team"
+              echo "Installed-Size: $installed_size"
+              echo "Description: NINA plugin package for $install_folder"
+            } > "$control_dir/control"
+            deb_path="${{ env.PLUGIN_ARTIFACT_DIR }}/${deb_package}_${plugin_version}_${{ env.DEB_ARCH }}_${{ steps.release_tag.outputs.date }}.deb"
+            dpkg-deb --build "$deb_root" "$deb_path"
+            sha256sum "$deb_path" > "$deb_path.sha256"
+          ); then
+            echo "$deb_package" | tee -a "${{ env.PLUGIN_FAILURES_FILE }}"
+          fi
+
+      - name: Build ninaAPI plugin deb
+        shell: bash
+        run: |
+          set -euo pipefail
+          project_path="NINA.Plugins/ninaAPI/ninaAPI/ninaAPI.csproj"
+          install_folder="ninaAPI"
+          deb_package="pins-plugin-ninaapi"
+          plugin_dir=$(dirname "$project_path")
+          if ! (
+            set -euo pipefail
+            assembly_info="$plugin_dir/Properties/AssemblyInfo.cs"
+            if [ ! -f "$assembly_info" ]; then
+              assembly_info=$(find "$plugin_dir" -name AssemblyInfo.cs | head -n 1)
+            fi
+            if [ -z "$assembly_info" ] || [ ! -f "$assembly_info" ]; then
+              echo "AssemblyInfo.cs not found for $deb_package" >&2
+              exit 1
+            fi
+            assembly_version_line=$(grep -E 'AssemblyVersion' "$assembly_info" || true)
+            plugin_version=$(echo "$assembly_version_line" | sed -E 's/.*"([^\"]+)".*/\1/')
+            if [ -z "$plugin_version" ]; then
+              echo "AssemblyVersion not found in $assembly_info" >&2
+              exit 1
+            fi
+            dotnet restore "$project_path"
+            dotnet build "$project_path" -c ${{ env.BUILD_CONFIGURATION }} --no-restore ${{ env.PLUGIN_MSBUILD_ARGS }}
+            build_root="$plugin_dir/bin/${{ env.BUILD_CONFIGURATION }}"
+            tfm_dir=$(find "$build_root" -maxdepth 1 -type d -name 'net*' | head -n 1)
+            if [ -z "$tfm_dir" ]; then
+              echo "Could not locate target framework output under $build_root" >&2
+              exit 1
+            fi
+            deb_root="${{ env.PLUGIN_DEB_BASE }}/$deb_package"
+            install_root="$deb_root${{ env.PLUGINS_INSTALL_BASE }}/$install_folder"
+            rm -rf "$deb_root"
+            mkdir -p "$install_root"
+            rsync -a "$tfm_dir/" "$install_root/"
+            extra_libs="$plugin_dir/extra-libs"
+            if [ -d "$extra_libs" ]; then
+              find "$extra_libs" -maxdepth 1 -type f -name '*.dll' -exec cp {} "$install_root/" \;
+            fi
+            app_dir="$plugin_dir/app"
+            if [ -d "$app_dir" ]; then
+              rm -rf "$install_root/app"
+              cp -a "$app_dir" "$install_root/app"
+            fi
+            control_dir="$deb_root/DEBIAN"
+            mkdir -p "$control_dir"
+            installed_size=$(du -sk "$deb_root${{ env.PLUGINS_INSTALL_BASE }}" | cut -f1)
+            {
+              echo "Package: $deb_package"
+              echo "Version: $plugin_version"
+              echo "Section: misc"
+              echo "Priority: optional"
+              echo "Architecture: ${{ env.DEB_ARCH }}"
+              echo "Maintainer: N.I.N.A. Team"
+              echo "Installed-Size: $installed_size"
+              echo "Description: NINA plugin package for $install_folder"
+            } > "$control_dir/control"
+            deb_path="${{ env.PLUGIN_ARTIFACT_DIR }}/${deb_package}_${plugin_version}_${{ env.DEB_ARCH }}_${{ steps.release_tag.outputs.date }}.deb"
+            dpkg-deb --build "$deb_root" "$deb_path"
+            sha256sum "$deb_path" > "$deb_path.sha256"
+          ); then
+            echo "$deb_package" | tee -a "${{ env.PLUGIN_FAILURES_FILE }}"
+          fi
+
+      - name: Build PolarAlignment plugin deb
+        shell: bash
+        run: |
+          set -euo pipefail
+          project_path="NINA.Plugins/PolarAlignment/PolarAlignment/NINA.Plugins.PolarAlignment.csproj"
+          install_folder="PolarAlignment"
+          deb_package="pins-plugin-polaralignment"
+          plugin_dir=$(dirname "$project_path")
+          if ! (
+            set -euo pipefail
+            assembly_info="$plugin_dir/Properties/AssemblyInfo.cs"
+            if [ ! -f "$assembly_info" ]; then
+              assembly_info=$(find "$plugin_dir" -name AssemblyInfo.cs | head -n 1)
+            fi
+            if [ -z "$assembly_info" ] || [ ! -f "$assembly_info" ]; then
+              echo "AssemblyInfo.cs not found for $deb_package" >&2
+              exit 1
+            fi
+            assembly_version_line=$(grep -E 'AssemblyVersion' "$assembly_info" || true)
+            plugin_version=$(echo "$assembly_version_line" | sed -E 's/.*"([^\"]+)".*/\1/')
+            if [ -z "$plugin_version" ]; then
+              echo "AssemblyVersion not found in $assembly_info" >&2
+              exit 1
+            fi
+            dotnet restore "$project_path"
+            dotnet build "$project_path" -c ${{ env.BUILD_CONFIGURATION }} --no-restore ${{ env.PLUGIN_MSBUILD_ARGS }}
+            build_root="$plugin_dir/bin/${{ env.BUILD_CONFIGURATION }}"
+            tfm_dir=$(find "$build_root" -maxdepth 1 -type d -name 'net*' | head -n 1)
+            if [ -z "$tfm_dir" ]; then
+              echo "Could not locate target framework output under $build_root" >&2
+              exit 1
+            fi
+            deb_root="${{ env.PLUGIN_DEB_BASE }}/$deb_package"
+            install_root="$deb_root${{ env.PLUGINS_INSTALL_BASE }}/$install_folder"
+            rm -rf "$deb_root"
+            mkdir -p "$install_root"
+            rsync -a "$tfm_dir/" "$install_root/"
+            extra_libs="$plugin_dir/extra-libs"
+            if [ -d "$extra_libs" ]; then
+              find "$extra_libs" -maxdepth 1 -type f -name '*.dll' -exec cp {} "$install_root/" \;
+            fi
+            app_dir="$plugin_dir/app"
+            if [ -d "$app_dir" ]; then
+              rm -rf "$install_root/app"
+              cp -a "$app_dir" "$install_root/app"
+            fi
+            control_dir="$deb_root/DEBIAN"
+            mkdir -p "$control_dir"
+            installed_size=$(du -sk "$deb_root${{ env.PLUGINS_INSTALL_BASE }}" | cut -f1)
+            {
+              echo "Package: $deb_package"
+              echo "Version: $plugin_version"
+              echo "Section: misc"
+              echo "Priority: optional"
+              echo "Architecture: ${{ env.DEB_ARCH }}"
+              echo "Maintainer: N.I.N.A. Team"
+              echo "Installed-Size: $installed_size"
+              echo "Description: NINA plugin package for $install_folder"
+            } > "$control_dir/control"
+            deb_path="${{ env.PLUGIN_ARTIFACT_DIR }}/${deb_package}_${plugin_version}_${{ env.DEB_ARCH }}_${{ steps.release_tag.outputs.date }}.deb"
+            dpkg-deb --build "$deb_root" "$deb_path"
+            sha256sum "$deb_path" > "$deb_path.sha256"
+          ); then
+            echo "$deb_package" | tee -a "${{ env.PLUGIN_FAILURES_FILE }}"
+          fi
+
+      - name: Build Touch-N-Stars plugin deb
+        shell: bash
+        run: |
+          set -euo pipefail
+          project_path="NINA.Plugins/Touch-N-Stars/Touch-N-Stars/Touch-N-Stars.csproj"
+          install_folder="Touch-N-Stars"
+          deb_package="pins-plugin-touch-n-stars"
+          plugin_dir=$(dirname "$project_path")
+          tmp_dir="$plugin_dir/frontend-build"
+          if ! (
+            set -euo pipefail
+            assembly_info="$plugin_dir/Properties/AssemblyInfo.cs"
+            if [ ! -f "$assembly_info" ]; then
+              assembly_info=$(find "$plugin_dir" -name AssemblyInfo.cs | head -n 1)
+            fi
+            if [ -z "$assembly_info" ] || [ ! -f "$assembly_info" ]; then
+              echo "AssemblyInfo.cs not found for $deb_package" >&2
+              exit 1
+            fi
+            assembly_version_line=$(grep -E 'AssemblyVersion' "$assembly_info" || true)
+            plugin_version=$(echo "$assembly_version_line" | sed -E 's/.*"([^\"]+)".*/\1/')
+            if [ -z "$plugin_version" ]; then
+              echo "AssemblyVersion not found in $assembly_info" >&2
+              exit 1
+            fi
+            rm -rf "$tmp_dir" "$plugin_dir/app"
+            git clone --branch pins --single-branch https://github.com/Touch-N-Stars/Touch-N-Stars.git "$tmp_dir"
+            pushd "$tmp_dir" >/dev/null
+            npm install
+            npm run build
+            popd >/dev/null
+            mv "$tmp_dir/dist" "$plugin_dir/app"
+            dotnet restore "$project_path"
+            dotnet build "$project_path" -c ${{ env.BUILD_CONFIGURATION }} --no-restore ${{ env.PLUGIN_MSBUILD_ARGS }}
+            build_root="$plugin_dir/bin/${{ env.BUILD_CONFIGURATION }}"
+            tfm_dir=$(find "$build_root" -maxdepth 1 -type d -name 'net*' | head -n 1)
+            if [ -z "$tfm_dir" ]; then
+              echo "Could not locate target framework output under $build_root" >&2
+              exit 1
+            fi
+            deb_root="${{ env.PLUGIN_DEB_BASE }}/$deb_package"
+            install_root="$deb_root${{ env.PLUGINS_INSTALL_BASE }}/$install_folder"
+            rm -rf "$deb_root"
+            mkdir -p "$install_root"
+            rsync -a "$tfm_dir/" "$install_root/"
+            app_dir="$plugin_dir/app"
+            if [ -d "$app_dir" ]; then
+              rm -rf "$install_root/app"
+              cp -a "$app_dir" "$install_root/app"
+            fi
+            extra_libs="$plugin_dir/extra-libs"
+            if [ -d "$extra_libs" ]; then
+              find "$extra_libs" -maxdepth 1 -type f -name '*.dll' -exec cp {} "$install_root/" \;
+            fi
+            control_dir="$deb_root/DEBIAN"
+            mkdir -p "$control_dir"
+            installed_size=$(du -sk "$deb_root${{ env.PLUGINS_INSTALL_BASE }}" | cut -f1)
+            {
+              echo "Package: $deb_package"
+              echo "Version: $plugin_version"
+              echo "Section: misc"
+              echo "Priority: optional"
+              echo "Architecture: ${{ env.DEB_ARCH }}"
+              echo "Maintainer: N.I.N.A. Team"
+              echo "Installed-Size: $installed_size"
+              echo "Description: NINA plugin package for $install_folder"
+            } > "$control_dir/control"
+            deb_path="${{ env.PLUGIN_ARTIFACT_DIR }}/${deb_package}_${plugin_version}_${{ env.DEB_ARCH }}_${{ steps.release_tag.outputs.date }}.deb"
+            dpkg-deb --build "$deb_root" "$deb_path"
+            sha256sum "$deb_path" > "$deb_path.sha256"
+          ); then
+            echo "$deb_package" | tee -a "${{ env.PLUGIN_FAILURES_FILE }}"
+          fi
+
+      - name: Summarize plugin build status
+        if: always()
+        run: |
+          if [ -s "${{ env.PLUGIN_FAILURES_FILE }}" ]; then
+            echo "The following plugin packages failed to build:" >&2
+            cat "${{ env.PLUGIN_FAILURES_FILE }}" >&2
+            exit 1
+          fi
+          echo "All plugin packages built successfully."
+
+      - name: Publish deb-only GitHub release
+        uses: softprops/action-gh-release@v2
+        if: success()
+        with:
+          tag_name: ${{ steps.release_tag.outputs.value }}
+          name: Release ${{ steps.release_tag.outputs.value }}
+          body: |
+            Automated release ${{ steps.release_tag.outputs.value }} containing the Raspberry Pi build and plugin Debian packages.
+          files: |
+            artifacts/${{ env.DEB_PACKAGE }}_${{ steps.version.outputs.package_version }}_${{ env.DEB_ARCH }}_${{ steps.release_tag.outputs.date }}.deb
+            artifacts/plugins/*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload plugin deb artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-debs
+          path: ${{ env.PLUGIN_ARTIFACT_DIR }}
+          retention-days: 30
