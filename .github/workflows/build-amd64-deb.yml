@@ -54,32 +54,32 @@ jobs:
             git submodule update --init --recursive "$path"
           done < <(git config -f .gitmodules --get-regexp '^submodule\..*\.path$')
 
-      - name: Populate NINA/External from zip bundle
-        shell: bash
-        run: |
-          set -euo pipefail
+      # - name: Populate NINA/External from zip bundle
+      #   shell: bash
+      #   run: |
+      #     set -euo pipefail
 
-          url="http://cloud.astro-narren.de/public.php/dav/files/7tEAZoEpCMCYyeX/?accept=zip"
-          tmp_dir="$(mktemp -d)"
-          zip_path="$tmp_dir/external.zip"
-          unzip_dir="$tmp_dir/unzipped"
+      #     url="http://cloud.astro-narren.de/public.php/dav/files/7tEAZoEpCMCYyeX/?accept=zip"
+      #     tmp_dir="$(mktemp -d)"
+      #     zip_path="$tmp_dir/external.zip"
+      #     unzip_dir="$tmp_dir/unzipped"
 
-          echo "Downloading External bundle from: $url"
-          curl -L --fail --retry 3 --retry-delay 5 -o "$zip_path" "$url"
+      #     echo "Downloading External bundle from: $url"
+      #     curl -L --fail --retry 3 --retry-delay 5 -o "$zip_path" "$url"
 
-          rm -rf "NINA/External"
-          mkdir -p "NINA/External"
-          unzip -q "$zip_path" -d "$unzip_dir"
+      #     rm -rf "NINA/External"
+      #     mkdir -p "NINA/External"
+      #     unzip -q "$zip_path" -d "$unzip_dir"
 
-          if [ ! -d "$unzip_dir/external" ]; then
-            echo "Downloaded zip did not contain top-level folder 'external'" >&2
-            echo "Top-level entries:" >&2
-            (cd "$unzip_dir" && find . -mindepth 1 -maxdepth 2 -print | head -n 50) >&2
-            exit 1
-          fi
+      #     if [ ! -d "$unzip_dir/external" ]; then
+      #       echo "Downloaded zip did not contain top-level folder 'external'" >&2
+      #       echo "Top-level entries:" >&2
+      #       (cd "$unzip_dir" && find . -mindepth 1 -maxdepth 2 -print | head -n 50) >&2
+      #       exit 1
+      #     fi
 
-          rsync -a "$unzip_dir/external/" "NINA/External/"
-          echo "External bundle extracted into NINA/External"
+      #     rsync -a "$unzip_dir/external/" "NINA/External/"
+      #     echo "External bundle extracted into NINA/External"
 
       - name: Setup .NET 10 SDK
         uses: actions/setup-dotnet@v4
