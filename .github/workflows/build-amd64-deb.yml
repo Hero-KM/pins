@@ -562,23 +562,25 @@ jobs:
           fi
           echo "All plugin packages built successfully."
 
-      - name: Publish deb-only GitHub release
-        uses: softprops/action-gh-release@v2
-        if: success()
-        with:
-          tag_name: ${{ steps.release_tag.outputs.value }}
-          name: Release ${{ steps.release_tag.outputs.value }}
-          body: |
-            Automated release ${{ steps.release_tag.outputs.value }} containing the Raspberry Pi build and plugin Debian packages.
-          files: |
-            artifacts/${{ env.DEB_PACKAGE }}_${{ steps.version.outputs.package_version }}_${{ env.DEB_ARCH }}_${{ steps.release_tag.outputs.date }}.deb
-            artifacts/plugins/*.deb
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload plugin deb artifacts
+      - name: Upload deb artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: plugin-debs
-          path: ${{ env.PLUGIN_ARTIFACT_DIR }}
+          name: artifacts-debs
+          path: artifacts
           retention-days: 30
+          
+      # - name: Publish deb-only GitHub release
+      #   uses: softprops/action-gh-release@v2
+      #   if: success()
+      #   with:
+      #     tag_name: ${{ steps.release_tag.outputs.value }}
+      #     name: Release ${{ steps.release_tag.outputs.value }}
+      #     body: |
+      #       Automated release ${{ steps.release_tag.outputs.value }} containing the Raspberry Pi build and plugin Debian packages.
+      #     files: |
+      #       artifacts/${{ env.DEB_PACKAGE }}_${{ steps.version.outputs.package_version }}_${{ env.DEB_ARCH }}_${{ steps.release_tag.outputs.date }}.deb
+      #       artifacts/plugins/*.deb
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    
